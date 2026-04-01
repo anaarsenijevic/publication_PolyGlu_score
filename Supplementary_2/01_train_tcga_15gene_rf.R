@@ -1,6 +1,5 @@
 # TCGA preprocessing, training, and cross-validation of 15-gene random forest classifier
 #
-#
 # Input:
 # - dds_*_matched_group.rds files
 #
