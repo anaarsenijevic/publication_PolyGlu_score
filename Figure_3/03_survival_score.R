@@ -1,12 +1,14 @@
 #!/usr/bin/env Rscript
 
-# Pan-cancer survival analysis using a 9-gene RF tumor score
+# Pan-cancer survival and vital status analysis using a 9-gene RF tumor score
 #
 # This script:
 # 1. trains a pan-cancer random forest classifier on matched TCGA tumour-normal cohorts
 # 2. scores tumour samples across TCGA projects using local SummarizedExperiment RDS files
 # 3. harmonizes clinical annotations and computes overall survival
-# 4. generates a Kaplan-Meier plot comparing the top and bottom RF score quartiles
+# 4. restricts survival analysis to the bottom and top quartiles of the RF score
+# 5. generates a Kaplan-Meier plot with 5-year survival crosshairs
+# 6. compares RF tumor scores between Alive and Deceased patients pan-cancer
 #
 # Input:
 # - dds_*_matched_group.rds files
@@ -16,9 +18,9 @@
 # - Edit all input paths below before running
 # - The fixed 9-gene panel is:
 #   TTLL4, TTLL5, TTLL6, TTLL7, TTLL11, AGBL1, AGBL3, AGBL4, AGBL5
-# - Survival analysis is restricted to the bottom and top quartiles of the RF score
 # - Overall survival is computed from days to death or last follow-up
-
+# - Survival analysis includes only patients in the bottom and top RF score quartiles
+# - Vital status analysis compares RF tumor score distributions in Alive vs Deceased patients
 suppressPackageStartupMessages({
   library(tidyverse)
   library(DESeq2)
@@ -31,6 +33,8 @@ suppressPackageStartupMessages({
   library(survival)
   library(survminer)
   library(TCGAbiolinks)
+  library(coin)
+  library(effsize)
 })
 
 set.seed(123)
@@ -573,3 +577,131 @@ km$plot <- km$plot +
   )
 
 print(km)
+
+# ------------------------------------------------------------------
+# Pan-cancer RF tumor score by vital status
+# ------------------------------------------------------------------
+
+pan_df <- merged_df %>%
+  filter(!is.na(status), !is.na(rf_tumor_score)) %>%
+  mutate(
+    Status = factor(
+      ifelse(status == 1, "Deceased", "Alive"),
+      levels = c("Alive", "Deceased")
+    )
+  )
+
+wilx <- wilcox.test(rf_tumor_score ~ Status, data = pan_df, exact = FALSE)
+p_overall <- wilx$p.value
+
+cd <- effsize::cliff.delta(rf_tumor_score ~ Status, data = pan_df)
+cd_est <- unname(cd$estimate)
+cd_mag <- cd$magnitude
+
+pan_df2 <- pan_df %>%
+  filter(!is.na(Cancer_Type), is.finite(rf_tumor_score)) %>%
+  mutate(Cancer_Type = factor(Cancer_Type))
+
+strata_ok <- pan_df2 %>%
+  group_by(Cancer_Type) %>%
+  summarise(n_levels = n_distinct(Status), .groups = "drop") %>%
+  filter(n_levels == 2) %>%
+  pull(Cancer_Type)
+
+pan_df_ok <- pan_df2 %>%
+  filter(Cancer_Type %in% strata_ok)
+
+wt_strat <- coin::wilcox_test(
+  rf_tumor_score ~ Status | Cancer_Type,
+  data = pan_df_ok,
+  distribution = "approximate"
+)
+
+p_strat <- coin::pvalue(wt_strat)
+
+cat(sprintf(
+  "Overall Wilcoxon p = %.3g | Cliff's delta = %.3f (%s)\nStratified Wilcoxon p = %.3g\n",
+  p_overall, cd_est, cd_mag, p_strat
+))
+
+write.csv(
+  pan_df,
+  file.path(out_dir, "tcga_pan_rf_scores_alive_vs_deceased.csv"),
+  row.names = FALSE
+)
+
+y_min <- min(pan_df$rf_tumor_score, na.rm = TRUE)
+y_max <- max(pan_df$rf_tumor_score, na.rm = TRUE)
+y_rng <- y_max - y_min
+
+ns <- pan_df %>%
+  count(Status)
+
+p_label <- paste0(
+  "Wilcoxon p = ",
+  ifelse(p_overall < 1e-3, "< 0.001", signif(p_overall, 3))
+)
+
+p_pan <- ggplot(pan_df, aes(x = Status, y = rf_tumor_score, fill = Status)) +
+  geom_boxplot(
+    width = 0.45,
+    outlier.shape = NA,
+    alpha = 0.9,
+    linewidth = 0.6
+  ) +
+  scale_fill_manual(
+    values = c("Alive" = "#4F7052", "Deceased" = "#B45757")
+  ) +
+  labs(
+    title = "Pan-cancer RF tumor score by vital status",
+    x = NULL,
+    y = "RF Tumor Score (probability)"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    axis.title = element_text(size = 17),
+    axis.text = element_text(size = 15),
+    legend.position = "none",
+    plot.margin = margin(15, 25, 15, 15),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black", linewidth = 0.8),
+    axis.ticks = element_line(color = "black", linewidth = 0.8)
+  ) +
+  coord_cartesian(ylim = c(y_min, y_max + 0.12 * y_rng), clip = "off") +
+  annotate(
+    "text",
+    x = 1,
+    y = y_min,
+    label = paste0("n = ", ns$n[ns$Status == "Alive"]),
+    vjust = 1.2,
+    size = 5
+  ) +
+  annotate(
+    "text",
+    x = 2,
+    y = y_min,
+    label = paste0("n = ", ns$n[ns$Status == "Deceased"]),
+    vjust = 1.2,
+    size = 5
+  ) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = y_max + 0.08 * y_rng,
+    label = p_label,
+    vjust = 0,
+    size = 5
+  )
+
+print(p_pan)
+
+ggsave(
+  file.path(out_dir, "PanTCGA_RFscore_Alive_vs_Deceased.png"),
+  p_pan,
+  width = 6,
+  height = 5,
+  dpi = 300
+)
+
