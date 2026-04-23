@@ -1,22 +1,19 @@
-# Randomization challenge for the 9-gene TTLL/AGBL panel across four external datasets
+# Randomization challenge for the 9-gene TTLL/AGBL panel across three external datasets
 #
 # This script:
 # 1. reads matched TCGA tumour-normal DESeq2 objects
 # 2. extracts VST-transformed expression values and maps genes to symbols
-# 3. builds four external validation datasets:
-#    - BRCA patient cohort
+# 3. builds three external validation datasets:
 #    - GSE87410 lung cohort
 #    - CPTAC kidney cohort
 #    - Korean CRC cohort
 # 4. trains a pancancer random forest model on the observed 9-gene panel
-# 5. computes its mean AUC across the four external datasets
+# 5. computes its mean AUC across the three external datasets
 # 6. compares it with 100 random 9-gene panels sampled from the shared gene universe
 # 7. reports the empirical p-value and plots the null distribution
 #
 # Input:
 # - dds_*_matched_group.rds files
-# - BRCA Salmon quantification files
-# - Gencode GTF annotation file
 # - GSE87410_raw_counts_GRCh38.p13_NCBI.tsv.gz
 # - GSM_sample_map.csv
 # - downloaded CPTAC kidney STAR-count files in GDC_kidney_filtered/
@@ -27,17 +24,15 @@
 # - The observed panel is the fixed 9-gene model:
 #   TTLL4, TTLL5, TTLL6, TTLL7, TTLL11, AGBL1, AGBL3, AGBL4, AGBL5
 # - Random panels are sampled from the shared gene universe present in TCGA
-#   and in all four external datasets
+#   and in all three external datasets
 # - The null distribution uses 100 random panels by default
 
 suppressPackageStartupMessages({
   library(DESeq2)
-  library(tximport)
   library(tidyverse)
   library(biomaRt)
   library(AnnotationDbi)
   library(org.Hs.eg.db)
-  library(GenomicFeatures)
   library(caret)
   library(randomForest)
   library(pROC)
@@ -53,9 +48,6 @@ set.seed(42)
 
 tcga_dir <- "path-to-tcga-dds-files"
 
-brca_salmon_dir <- "path-to-brca-salmon-folder"
-gtf_file <- "path-to-gencode.gtf"
-
 lung_dir <- "path-to-GSE87410-folder"
 
 kidney_dir <- "path-to-CPTAC-kidney-folder"
@@ -70,12 +62,7 @@ crc_counts_file <- file.path(crc_dir, "CMCBSN_expectedcount_342.txt")
 if (!dir.exists(tcga_dir)) {
   stop("Please set 'tcga_dir' to the folder containing dds_*_matched_group.rds files.")
 }
-if (!dir.exists(brca_salmon_dir)) {
-  stop("Please set 'brca_salmon_dir' to the folder containing BRCA Salmon quantifications.")
-}
-if (!file.exists(gtf_file)) {
-  stop("Please set 'gtf_file' to the Gencode GTF annotation file.")
-}
+
 if (!dir.exists(lung_dir)) {
   stop("Please set 'lung_dir' to the folder containing the GSE87410 files.")
 }
@@ -181,93 +168,9 @@ ctrl_pan <- trainControl(
 
 tune_len <- 5
 
-# ------------------------------------------------------------------
-# External dataset 1: BRCA patient cohort
-# ------------------------------------------------------------------
-
-message("Loading BRCA cohort...")
-
-samples_brca <- tibble::tribble(
-  ~sample, ~tissue, ~group, ~path,
-  "1NAT",  "NAT", "non-invasive", "salmon_1NAT/quant.sf",
-  "2PT",   "PT",  "non-invasive", "salmon_2PT/quant.sf",
-  "3NAT",  "NAT", "non-invasive", "salmon_3NAT/quant.sf",
-  "4PT",   "PT",  "non-invasive", "salmon_4PT/quant.sf",
-  "5NAT",  "NAT", "metastatic",   "salmon_5NAT/quant.sf",
-  "6PT",   "PT",  "metastatic",   "salmon_6PT/quant.sf",
-  "7NAT",  "NAT", "metastatic",   "salmon_7NAT/quant.sf",
-  "8PT",   "PT",  "metastatic",   "salmon_8PT/quant.sf",
-  "9NAT",  "NAT", "metastatic",   "salmon_9NAT/quant.sf",
-  "10PT",  "PT",  "metastatic",   "salmon_10PT/quant.sf",
-  "11NAT", "NAT", "TNBC",         "salmon_11NAT/quant.sf",
-  "12PT",  "PT",  "TNBC",         "salmon_12PT/quant.sf",
-  "13NAT", "NAT", "TNBC",         "salmon_13NAT/quant.sf",
-  "14PT",  "PT",  "TNBC",         "salmon_14PT/quant.sf",
-  "15NAT", "NAT", "TNBC",         "salmon_15NAT/quant.sf",
-  "16PT",  "PT",  "TNBC",         "salmon_16PT/quant.sf",
-  "17NAT", "NAT", "non-invasive", "salmon_17NAT/quant.sf",
-  "18PT",  "PT",  "non-invasive", "salmon_18PT/quant.sf"
-)
-
-txdb <- makeTxDbFromGFF(gtf_file, format = "gtf")
-
-tx2gene <- AnnotationDbi::select(
-  txdb,
-  keys = keys(txdb, keytype = "TXNAME"),
-  columns = "GENEID",
-  keytype = "TXNAME"
-) %>%
-  mutate(
-    TXNAME = sub("\\..*", "", TXNAME),
-    GENEID = sub("\\..*", "", GENEID)
-  ) %>%
-  distinct()
-
-files_brca <- file.path(brca_salmon_dir, samples_brca$path)
-names(files_brca) <- samples_brca$sample
-
-missing_brca <- files_brca[!file.exists(files_brca)]
-if (length(missing_brca) > 0) {
-  stop("Missing BRCA Salmon files:\n", paste(missing_brca, collapse = "\n"))
-}
-
-txi_b <- tximport(
-  files_brca,
-  type = "salmon",
-  tx2gene = tx2gene,
-  ignoreTxVersion = TRUE
-)
-
-dds_b <- DESeqDataSetFromTximport(
-  txi_b,
-  colData = samples_brca %>%
-    dplyr::select(sample, tissue, group) %>%
-    column_to_rownames("sample"),
-  design = ~ tissue
-)
-
-vsd_b <- vst(dds_b, blind = TRUE)
-mat_b <- assay(vsd_b)
-
-ens_b <- sub("\\..*", "", rownames(mat_b))
-sym_b <- mapIds(
-  org.Hs.eg.db,
-  keys = ens_b,
-  column = "SYMBOL",
-  keytype = "ENSEMBL",
-  multiVals = "first"
-)
-
-rownames(mat_b) <- ifelse(is.na(sym_b) | sym_b == "", ens_b, sym_b)
-
-brca_expr_full <- as.data.frame(t(mat_b))
-brca_truth <- factor(
-  ifelse(samples_brca$tissue == "PT", "Tumor", "Normal"),
-  levels = c("Normal", "Tumor")
-)
 
 # ------------------------------------------------------------------
-# External dataset 2: Lung GSE87410
+# External dataset 1: Lung GSE87410
 # ------------------------------------------------------------------
 
 message("Loading GSE87410 lung cohort...")
@@ -317,7 +220,7 @@ lung_truth <- factor(
 )
 
 # ------------------------------------------------------------------
-# External dataset 3: Kidney CPTAC-3
+# External dataset 2: Kidney CPTAC-3
 # ------------------------------------------------------------------
 
 message("Loading CPTAC kidney cohort...")
@@ -392,7 +295,7 @@ kidney_expr_full <- as.data.frame(t(mat_k))
 kidney_truth <- metadata_kid$condition
 
 # ------------------------------------------------------------------
-# External dataset 4: Korean CRC
+# External dataset 3: Korean CRC
 # ------------------------------------------------------------------
 
 message("Loading Korean CRC cohort...")
@@ -445,7 +348,6 @@ crc_truth <- factor(
 # ------------------------------------------------------------------
 
 ext_sets <- list(
-  BRCA = list(expr = brca_expr_full, truth = brca_truth),
   Lung = list(expr = lung_expr_full, truth = lung_truth),
   Kidney = list(expr = kidney_expr_full, truth = kidney_truth),
   CRC_KR = list(expr = crc_expr_full, truth = crc_truth)
@@ -530,7 +432,7 @@ message("Evaluating observed panel: ", paste(panel_eval_genes, collapse = ", "))
 set.seed(31)
 obs_auc <- eval_gene_set(panel_eval_genes, verbose = TRUE)
 
-message("Observed mean AUC across 4 external datasets = ", sprintf("%.3f", obs_auc))
+message("Observed mean AUC across 3 external datasets = ", sprintf("%.3f", obs_auc))
 
 # ------------------------------------------------------------------
 # Null distribution: 100 random 9-gene panels
@@ -571,7 +473,7 @@ hist(
   xlim = c(0, 1),
   xaxt = "n",
   main = "Null distribution of mean AUC from random 9-gene panels",
-  xlab = "Mean AUC across BRCA, Lung, Kidney, and Korean CRC"
+  xlab = "Mean AUC across Lung, Kidney, and Korean CRC"
 )
 
 axis(1, at = seq(0, 1, by = 0.1), labels = sprintf("%.1f", seq(0, 1, by = 0.1)))
