@@ -66,7 +66,8 @@ R 4.4.2
 - ggpubr (0.6.2)  
 - survival (3.7-0)  
 - survminer (0.5.1)  
-- TCGAbiolinks (2.34.1)  
+- TCGAbiolinks (2.34.1)
+- MSigDBR (26.1.0)
 
 ---
 
