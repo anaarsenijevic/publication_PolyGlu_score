@@ -21,8 +21,6 @@
 # - downloaded CPTAC kidney STAR-count files in GDC_kidney_filtered/
 # - CMCBSN_expectedcount_342.txt
 #
-# Additional requirement:
-# - msigdbr package for retrieving MSigDB Hallmark gene sets
 #
 # Notes:
 # - Edit all input paths below before running
