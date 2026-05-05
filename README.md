@@ -68,6 +68,7 @@ R 4.4.2
 - survminer (0.5.1)  
 - TCGAbiolinks (2.34.1)
 - MSigDBR (26.1.0)
+- UCSCXenaTools (1.7.0)
 
 ---
 
