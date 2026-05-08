@@ -3,16 +3,9 @@
 # Input:
 # - dds_*_matched_group.rds files
 #
-# Output:
-# - tcga_15gene_expression.rds
-# - rf_15gene_tcga_model.rds
-# - rf_15gene_tcga_cv.rds
-# - tcga_sample_summary.csv
-# - rf_15gene_variable_importance.csv
-# - rf_15gene_model_summary.csv
 #
 # Notes:
-# - Edit 'tcga_dir' and 'output_dir' below before running
+# - Edit 'tcga_dir' below before running
 # - Ensembl IDs are mapped to gene symbols using org.Hs.eg.db
 # - Duplicate symbols are collapsed by mean expression
 
@@ -32,15 +25,11 @@ suppressPackageStartupMessages({
 # ------------------------------------------------------------------
 
 tcga_dir   <- "path-to-tcga-dds-files"
-output_dir <- "path-to-output-folder"
 
 if (!dir.exists(tcga_dir)) {
   stop("Please set 'tcga_dir' to the folder containing dds_*_matched_group.rds files.")
 }
 
-if (!dir.exists(output_dir)) {
-  dir.create(output_dir, recursive = TRUE)
-}
 
 # ------------------------------------------------------------------
 # Define 15-gene panel
@@ -189,107 +178,243 @@ print(importance_15)
 saveRDS(rf_15, file.path(output_dir, "rf_15gene_tcga_model.rds"))
 
 # ==================================================================
-# 3. CROSS-VALIDATION OF THE 15-GENE MODEL
+# 3. CROSS-VALIDATION ROC ANALYSIS — 15-GENE MODEL ONLY
 # ==================================================================
 
-ctrl <- trainControl(
-  method = "cv",
-  number = 5,
-  classProbs = TRUE,
-  summaryFunction = twoClassSummary,
-  savePredictions = "final"
+genes_15 <- feature_genes
+
+run_rf_cv_roc <- function(data, genes, model_name, seed = 123) {
+  
+  genes_present <- intersect(genes, colnames(data))
+  missing_genes <- setdiff(genes, genes_present)
+  
+  if (length(missing_genes) > 0) {
+    message(model_name, " missing genes: ", paste(missing_genes, collapse = ", "))
+  }
+  
+  df <- data %>%
+    dplyr::select(all_of(genes_present), condition_bin) %>%
+    filter(if_all(all_of(genes_present), ~ !is.na(.))) %>%
+    mutate(condition_bin = factor(condition_bin, levels = c("Normal", "Tumor")))
+  
+  x <- df[, genes_present, drop = FALSE]
+  y <- df$condition_bin
+  
+  ctrl <- trainControl(
+    method = "cv",
+    number = 5,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary,
+    savePredictions = "final"
+  )
+  
+  set.seed(seed)
+  rf_cv <- train(
+    x = x,
+    y = y,
+    method = "rf",
+    trControl = ctrl,
+    metric = "ROC",
+    ntree = 500
+  )
+  
+  best_mtry <- rf_cv$bestTune$mtry
+  
+  cv_preds <- rf_cv$pred %>%
+    filter(mtry == best_mtry) %>%
+    mutate(Resample = factor(Resample))
+  
+  roc_list <- cv_preds %>%
+    split(.$Resample) %>%
+    lapply(function(d) {
+      pROC::roc(
+        response = d$obs,
+        predictor = d$Tumor,
+        levels = c("Normal", "Tumor"),
+        direction = "<",
+        quiet = TRUE
+      )
+    })
+  
+  fold_auc <- tibble(
+    Fold = names(roc_list),
+    AUC = as.numeric(sapply(roc_list, pROC::auc)),
+    Model = model_name
+  )
+  
+  roc_df <- purrr::map2_dfr(
+    roc_list,
+    names(roc_list),
+    function(r, fold_name) {
+      tibble(
+        FPR = 1 - r$specificities,
+        TPR = r$sensitivities,
+        Fold = fold_name,
+        Model = model_name
+      )
+    }
+  )
+  
+  mean_fpr <- seq(0, 1, length.out = 101)
+  
+  mean_tpr_mat <- sapply(roc_list, function(r) {
+    fpr <- c(0, 1 - r$specificities, 1)
+    tpr <- c(0, r$sensitivities, 1)
+    
+    ord <- order(fpr)
+    
+    approx(
+      x = fpr[ord],
+      y = tpr[ord],
+      xout = mean_fpr,
+      ties = max,
+      rule = 2
+    )$y
+  })
+  
+  mean_roc_df <- tibble(
+    FPR = mean_fpr,
+    TPR = rowMeans(mean_tpr_mat, na.rm = TRUE),
+    Model = model_name
+  )
+  
+  list(
+    model = rf_cv,
+    roc_df = roc_df,
+    mean_roc_df = mean_roc_df,
+    fold_auc = fold_auc,
+    mean_auc = mean(fold_auc$AUC),
+    sd_auc = sd(fold_auc$AUC),
+    genes_used = genes_present
+  )
+}
+
+plot_fold_rocs_tcga_style <- function(roc_obj, title_txt) {
+  
+  df_mean <- roc_obj$mean_roc_df %>%
+    transmute(
+      fpr = FPR,
+      tpr = TPR,
+      model = "TCGA CV"
+    )
+  
+  ggplot() +
+    geom_line(
+      data = roc_obj$roc_df,
+      aes(x = FPR, y = TPR, group = Fold),
+      linewidth = 0.7,
+      alpha = 0.45,
+      color = "gray70"
+    ) +
+    geom_line(
+      data = df_mean,
+      aes(x = fpr, y = tpr, color = model),
+      linewidth = 1.4
+    ) +
+    geom_abline(linetype = "dashed", color = "gray70") +
+    scale_color_manual(
+      values = c("TCGA CV" = "coral1"),
+      breaks = c("TCGA CV")
+    ) +
+    labs(
+      title = title_txt,
+      subtitle = sprintf(
+        "Mean AUC = %.3f ± %.3f",
+        roc_obj$mean_auc,
+        roc_obj$sd_auc
+      ),
+      x = "False Positive Rate",
+      y = "True Positive Rate",
+      color = "Dataset"
+    ) +
+    coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5),
+      legend.position = "bottom",
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      panel.grid = element_blank()
+    )
+}
+
+roc_15 <- run_rf_cv_roc(
+  data = tcga_df,
+  genes = genes_15,
+  model_name = "15-gene model",
+  seed = 123
 )
 
-set.seed(123)
-rf_15_cv <- train(
-  x = x_tcga,
-  y = y_tcga,
-  method = "rf",
-  metric = "ROC",
-  trControl = ctrl
+saveRDS(roc_15$model, file.path(output_dir, "rf_15gene_tcga_cv.rds"))
+
+p_roc_15 <- plot_fold_rocs_tcga_style(
+  roc_15,
+  "ROC Curve: 15-Gene Model"
 )
 
-print(rf_15_cv)
-print(rf_15_cv$results)
+print(p_roc_15)
 
-saveRDS(rf_15_cv, file.path(output_dir, "rf_15gene_tcga_cv.rds"))
-
-cv_preds <- rf_15_cv$pred %>%
-  filter(mtry == rf_15_cv$bestTune$mtry)
-
-roc_tcga <- roc(cv_preds$obs, cv_preds$Tumor, quiet = TRUE)
-auc_tcga <- as.numeric(auc(roc_tcga))
-
-roc_tcga_df <- data.frame(
-  fpr = 1 - roc_tcga$specificities,
-  tpr = roc_tcga$sensitivities
+ggsave(
+  filename = file.path(output_dir, "rf_15gene_foldwise_ROC.pdf"),
+  plot = p_roc_15,
+  width = 5.5,
+  height = 5
 )
 
-ggplot(roc_tcga_df, aes(x = fpr, y = tpr)) +
-  geom_line(linewidth = 1.4, color = "#2C7FB8") +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray60") +
-  labs(
-    title = "ROC Curve: 15-Gene Model Cross-Validation in TCGA",
-    subtitle = sprintf("AUC = %.3f", auc_tcga),
-    x = "False Positive Rate",
-    y = "True Positive Rate"
+ggsave(
+  filename = file.path(output_dir, "rf_15gene_foldwise_ROC.png"),
+  plot = p_roc_15,
+  width = 5.5,
+  height = 5,
+  dpi = 300
+)
+
+# ==================================================================
+# 4. 15-GENE POOLED CROSS-VALIDATION CONFUSION MATRIX
+# ==================================================================
+
+cv_preds_15 <- roc_15$model$pred %>%
+  dplyr::filter(mtry == roc_15$model$bestTune$mtry) %>%
+  dplyr::mutate(
+    obs = factor(obs, levels = c("Normal", "Tumor")),
+    pred = factor(pred, levels = c("Normal", "Tumor"))
+  )
+
+cm_15 <- caret::confusionMatrix(
+  data = cv_preds_15$pred,
+  reference = cv_preds_15$obs,
+  positive = "Tumor"
+)
+
+print(cm_15)
+
+cm_15_df <- as.data.frame(cm_15$table)
+colnames(cm_15_df) <- c("Prediction", "Reference", "Freq")
+
+p_cm_15_coral <- ggplot(cm_15_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(aes(label = Freq), size = 6, fontface = "bold") +
+  scale_fill_gradient(
+    low = "white",
+    high = "coral1"
   ) +
-  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(
+    title = "Confusion Matrix — 15-Gene RF Model",
+    subtitle = "Pooled out-of-fold predictions from 5-fold cross-validation",
+    x = "True label",
+    y = "Predicted label",
+    fill = "Count"
+  ) +
   theme_minimal(base_size = 14) +
   theme(
     plot.title = element_text(face = "bold", hjust = 0.5),
-    plot.subtitle = element_text(hjust = 0.5)
+    plot.subtitle = element_text(hjust = 0.5),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    panel.grid = element_blank(),
+    legend.position = "right"
   )
 
-p_cm_cv <- plot_cm(
-  pred = cv_preds$pred,
-  truth = cv_preds$obs,
-  title = "Confusion Matrix: 15-Gene Model Cross-Validation in TCGA"
-)
+print(p_cm_15_coral)
 
-print(p_cm_cv)
-
-# ==================================================================
-# 4. SAVE SUMMARY TABLES
-# ==================================================================
-
-tcga_sample_summary <- tcga_df %>%
-  count(project, condition) %>%
-  tidyr::pivot_wider(
-    names_from = condition,
-    values_from = n,
-    values_fill = 0
-  ) %>%
-  arrange(project)
-
-model_summary <- tibble(
-  n_samples = nrow(tcga_df),
-  n_tumor = sum(tcga_df$condition_bin == "Tumor"),
-  n_normal = sum(tcga_df$condition_bin == "Normal"),
-  n_genes = length(feature_genes),
-  cv_auc = auc_tcga,
-  best_mtry = rf_15_cv$bestTune$mtry
-)
-
-write_csv(
-  tcga_sample_summary,
-  file.path(output_dir, "tcga_sample_summary.csv")
-)
-
-write_csv(
-  importance_15,
-  file.path(output_dir, "rf_15gene_variable_importance.csv")
-)
-
-write_csv(
-  model_summary,
-  file.path(output_dir, "rf_15gene_model_summary.csv")
-)
-
-message("Saved:")
-message(" - ", file.path(output_dir, "tcga_15gene_expression.rds"))
-message(" - ", file.path(output_dir, "rf_15gene_tcga_model.rds"))
-message(" - ", file.path(output_dir, "rf_15gene_tcga_cv.rds"))
-message(" - ", file.path(output_dir, "tcga_sample_summary.csv"))
-message(" - ", file.path(output_dir, "rf_15gene_variable_importance.csv"))
-message(" - ", file.path(output_dir, "rf_15gene_model_summary.csv"))
