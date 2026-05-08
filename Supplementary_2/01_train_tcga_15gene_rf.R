@@ -5,7 +5,7 @@
 #
 #
 # Notes:
-# - Edit 'tcga_dir' and 'output_dir' below before running
+# - Edit 'tcga_dir' below before running
 # - Ensembl IDs are mapped to gene symbols using org.Hs.eg.db
 # - Duplicate symbols are collapsed by mean expression
 
