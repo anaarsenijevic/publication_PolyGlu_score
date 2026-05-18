@@ -7,8 +7,7 @@
 # Notes:
 # - Edit 'input_dir' below before running
 # - PCA is run on VST-transformed expression values
-# - The first plot shows all samples together
-# - The second plot shows one PCA per project
+# - The plot shows all samples together
 
 suppressPackageStartupMessages({
   library(DESeq2)
@@ -139,60 +138,3 @@ p_pca_all <- ggplot(pca_df_all, aes(PC1, PC2, color = condition_bin)) +
 
 print(p_pca_all)
 
-# ------------------------------------------------------------------
-# PCA within each project
-# ------------------------------------------------------------------
-
-split_idx <- split(seq_len(nrow(tcga_clean)), tcga_clean$project)
-
-per_proj_df <- purrr::map_dfr(names(split_idx), function(proj) {
-  idx <- split_idx[[proj]]
-
-  Xp <- tcga_clean[idx, ] %>%
-    select(where(is.numeric)) %>%
-    as.matrix()
-
-  if (nrow(Xp) < 3 || ncol(Xp) < 2) {
-    return(NULL)
-  }
-
-  rownames(Xp) <- tcga_clean$sample[idx]
-
-  pca_p <- prcomp(Xp, center = TRUE, scale. = TRUE)
-  ve_p <- summary(pca_p)$importance[2, 1:2] * 100
-
-  tibble(
-    PC1 = pca_p$x[, 1],
-    PC2 = pca_p$x[, 2],
-    condition_bin = tcga_clean$condition_bin[idx],
-    project = proj,
-    project_lab = sprintf("%s (PC1 %.1f%%; PC2 %.1f%%)", proj, ve_p[1], ve_p[2])
-  )
-})
-
-per_proj_df$project_lab <- factor(
-  per_proj_df$project_lab,
-  levels = per_proj_df %>%
-    distinct(project, project_lab) %>%
-    pull(project_lab)
-)
-
-p_pca_per_project <- ggplot(
-  per_proj_df,
-  aes(x = PC1, y = PC2, color = condition_bin)
-) +
-  geom_point(size = 2, alpha = 0.9) +
-  scale_color_manual(values = col_map) +
-  labs(
-    title = "PCA of matched TCGA samples by project",
-    x = "PC1",
-    y = "PC2"
-  ) +
-  facet_wrap(~ project_lab, scales = "free") +
-  theme_minimal(base_size = 14) +
-  theme(
-    plot.title = element_text(face = "bold", hjust = 0.5),
-    legend.position = "bottom"
-  )
-
-print(p_pca_per_project)
