@@ -7,7 +7,7 @@ This repository contains scripts for the analysis of the Polyglutamylation (Poly
 This repository contains all scripts used to perform the bioinformatic analyses presented in:
 
 **Arsenijevic et al.**  
-*Dysregulation of the Microtubule Glutamylation–Deglutamylation Network Defines Tumor State and Reveals a Cancer Vulnerability*  
+*Transcriptional dysregulation of the microtubule polyglutamylation/deglutamylation enzyme network is a hallmark of human cancer*  
 *(Title subject to final revision)*
 
 ---
@@ -17,21 +17,19 @@ This repository contains all scripts used to perform the bioinformatic analyses 
 The scripts reproduce the main analyses of the study, from TCGA data processing to machine learning and external validation. The scripts are organised by figures.
 
 ### Main analyses
-
-1. Preprocessing of TCGA matched tumour–normal datasets  
-2. Expression profiling of TTLL and CCP (AGBL) genes across cancers  
-3. Principal component analysis (PCA) of tumour vs normal samples  
-4. Random forest classification of tumour vs normal samples  
-5. Backward feature elimination and model reduction  
-6. Segmented regression analysis to identify optimal gene panel size  
-7. External validation in colorectal, kidney, and lung cancer datasets  
-8. Comparison with cancer-specific classifiers  
-9. Random gene panel and label permutation controls  
-10. Assessment of internal and external gene importance  
-11. Scoring of cell lines using DepMap data  
-12. Association analyses with TCGA clinical categories  
-13. Survival analyses  
-14. Scoring of stages of cell transformation  
+ 
+1. Expression profiling of TTLL and CCP (AGBL) genes across TCGA cancers  
+2. Principal component analysis (PCA) of tumour vs normal samples  
+3. Random forest classification of tumour vs normal samples  
+4. Backward feature elimination and model reduction  
+5. Segmented regression analysis to identify optimal gene panel size  
+6. External validation in colorectal, kidney, and lung cancer datasets  
+7. Comparison with cancer-specific classifiers  
+8. Random gene panel and label permutation controls  
+9. Scoring of cell lines using DepMap data  
+10. Association analyses with TCGA clinical categories  
+11. Survival analyses  
+12. Scoring of stages of cell transformation  
 
 ---
 
@@ -83,5 +81,5 @@ R 4.4.2
 If you use this code, please cite:
 
 Arsenijevic et al.  
-*Dysregulation of the Microtubule Glutamylation–Deglutamylation Network Defines Tumor State and Reveals a Cancer Vulnerability*  
+*Transcriptional dysregulation of the microtubule polyglutamylation/deglutamylation enzyme network is a hallmark of human cancer*  
 *(Title subject to final revision)*
