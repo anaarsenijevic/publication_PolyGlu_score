@@ -50,7 +50,7 @@ crc_dir    <- "path-to/KoreanCRC"
 # ------------------------------------------------------------------
 
 panel_15 <- c(
-  "TTLL1", "TTLL4", "TTLL5", "TTLL6", "TTLL7", "TTLL9", "TTLL11", "TTLL13",
+  "TTLL1", "TTLL2", "TTLL4", "TTLL5", "TTLL6", "TTLL7", "TTLL9", "TTLL11", "TTLL13",
   "AGBL1", "AGBL2", "AGBL3", "AGBL4", "AGBL5", "AGTPBP1"
 )
 
