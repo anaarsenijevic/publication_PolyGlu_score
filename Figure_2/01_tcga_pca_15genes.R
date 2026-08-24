@@ -32,7 +32,7 @@ if (!dir.exists(input_dir)) {
 # Gene sets
 # ------------------------------------------------------------------
 
-ttll_genes <- c("TTLL1", "TTLL4", "TTLL5", "TTLL6", "TTLL7", "TTLL9", "TTLL11", "TTLL13")
+ttll_genes <- c("TTLL1", "TTLL2", "TTLL4", "TTLL5", "TTLL6", "TTLL7", "TTLL9", "TTLL11", "TTLL13")
 ccp_genes  <- c("AGBL1", "AGBL2", "AGBL3", "AGBL4", "AGBL5", "AGTPBP1")
 all_genes  <- unique(c(ttll_genes, ccp_genes))
 
