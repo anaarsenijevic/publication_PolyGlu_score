@@ -52,7 +52,7 @@ if (!file.exists(input_file)) {
 # ------------------------------------------------------------------
 
 ttll_genes <- c(
-  "TTLL1", "TTLL4", "TTLL5", "TTLL6", "TTLL7",
+  "TTLL1", "TTLL2", "TTLL4", "TTLL5", "TTLL6", "TTLL7",
   "TTLL9", "TTLL11", "TTLL13"
 )
 
