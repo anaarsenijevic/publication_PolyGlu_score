@@ -47,7 +47,13 @@ set.seed(123)
 
 tcga_dds_dir <- "path-to-tcga-dds-files"
 gdc_rds_dir <- "path-to-gdc-rds-files"
+out_dir <- "results_os"
 
+dir.create(
+  out_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
 if (!dir.exists(tcga_dds_dir)) {
   stop("Please set 'tcga_dds_dir' to the folder containing dds_*_matched_group.rds files.")
 }
@@ -327,7 +333,7 @@ if (length(missing_feats) > 0) {
 }
 
 newx <- expr_df[, feature_genes, drop = FALSE]
-valid_rows <- rowSums(is.na(newx)) < ncol(newx)
+valid_rows <- rowSums(is.na(newx)) == 0
 
 rf_tumor <- rep(NA_real_, nrow(expr_df))
 if (any(valid_rows)) {
@@ -500,22 +506,56 @@ quartile_df <- df_for_km %>%
   mutate(
     RF_group = factor(
       RF_group,
-      levels = c("High RF Score (Q4)", "Low RF Score (Q1)")
+      levels = c("Low RF Score (Q1)", "High RF Score (Q4)")
     )
   )
 
 message("N used for KM (Q1 vs Q4): ", nrow(quartile_df))
 
 fit_q <- survfit(Surv(time_years, status) ~ RF_group, data = quartile_df)
+                     # Log-rank test
+logrank_q <- survdiff(
+  Surv(time_years, status) ~ RF_group,
+  data = quartile_df
+)
 
-pal <- c("#B45757", "#4F7052")
+logrank_p <- pchisq(
+  logrank_q$chisq,
+  df = 1,
+  lower.tail = FALSE
+)
+
+# Cox model: High vs Low
+cox_q <- coxph(
+  Surv(time_years, status) ~ RF_group,
+  data = quartile_df
+)
+
+cox_sum <- summary(cox_q)
+
+HR <- cox_sum$coefficients[1, "exp(coef)"]
+HR_low <- cox_sum$conf.int[1, "lower .95"]
+HR_high <- cox_sum$conf.int[1, "upper .95"]
+
+stat_label <- sprintf(
+  "HR = %.2f (95%% CI %.2f-%.2f)\nLog-rank p = %.2g",
+  HR,
+  HR_low,
+  HR_high,
+  logrank_p
+)
+
+pal <- c(
+  "#4F7052",  # Low
+  "#B45757"   # High
+)
 
 km <- ggsurvplot(
   fit_q,
   data = quartile_df,
-  pval = TRUE,
+  pval = FALSE,
   conf.int = TRUE,
-  risk.table = TRUE,
+  risk.table = FALSE,
   censor = FALSE,
   surv.size = 1.4,
   legend.labs = levels(quartile_df$RF_group),
@@ -569,6 +609,17 @@ km$plot <- km$plot +
     hjust = 0.5,
     size = 4.5
   ) +
+
+  # HR, 95% CI and log-rank p-value
+  annotate(
+    "text",
+    x = 0.5,
+    y = 0.15,
+    label = stat_label,
+    hjust = 0,
+    size = 4.5
+  ) +
+
   theme(
     panel.grid.major = element_blank(),
     panel.grid.minor = element_blank(),
@@ -699,11 +750,5 @@ p_pan <- ggplot(pan_df, aes(x = Status, y = rf_tumor_score, fill = Status)) +
 
 print(p_pan)
 
-ggsave(
-  file.path(out_dir, "PanTCGA_RFscore_Alive_vs_Deceased.png"),
-  p_pan,
-  width = 6,
-  height = 5,
-  dpi = 300
-)
+
 
