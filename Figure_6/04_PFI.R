@@ -104,61 +104,135 @@ get_ensembl_connection <- function() {
 }
 
 plot_km <- function(df, title, y_label, fit_cox, out_prefix = NULL) {
+
+  # Low is always the reference group
+  df <- df %>%
+    mutate(
+      grp = factor(
+        grp,
+        levels = c("Low", "High")
+      )
+    )
+
+  # Cox model: HR = High vs Low
+  fit_cox <- coxph(
+    Surv(time_years, status) ~ grp,
+    data = df
+  )
+
   cox_summary <- summary(fit_cox)
 
   hr <- cox_summary$coef[1, "exp(coef)"]
   hr_l <- cox_summary$conf.int[1, "lower .95"]
   hr_u <- cox_summary$conf.int[1, "upper .95"]
-  p_hr <- cox_summary$coef[1, "Pr(>|z|)"]
 
-  worse_group <- if (hr > 1) "High" else "Low"
-  better_group <- if (worse_group == "High") "Low" else "High"
+  # Kaplan-Meier fit
+  fit <- survfit(
+    Surv(time_years, status) ~ grp,
+    data = df
+  )
 
-  df <- df %>%
-    mutate(grp = factor(grp, levels = c(better_group, worse_group)))
+  # Explicit log-rank test
+  logrank <- survdiff(
+    Surv(time_years, status) ~ grp,
+    data = df
+  )
 
-  fit <- survfit(Surv(time_years, status) ~ grp, data = df)
+  logrank_p <- pchisq(
+    logrank$chisq,
+    df = 1,
+    lower.tail = FALSE
+  )
+
+  p_label <- if (logrank_p < 0.0001) {
+    "< 0.0001"
+  } else {
+    format.pval(
+      logrank_p,
+      digits = 2
+    )
+  }
 
   hr_label <- sprintf(
-    "HR = %.2f (%.2f-%.2f)\np = %s",
-    hr, hr_l, hr_u, format_p(p_hr)
+    "HR = %.2f (95%% CI %.2f-%.2f)\nLog-rank p = %s",
+    hr,
+    hr_l,
+    hr_u,
+    p_label
   )
 
   km <- ggsurvplot(
     fit,
     data = df,
-    pval = TRUE,
+    pval = FALSE,
     conf.int = TRUE,
-    risk.table = TRUE,
+    risk.table = FALSE,
     censor = FALSE,
     surv.size = 1.4,
+
     legend.title = title,
-    legend.labs = c(better_group, worse_group),
+    legend.labs = c(
+      "Low (Q1)",
+      "High (Q4)"
+    ),
+
     xlab = "Time (years)",
     ylab = y_label,
+
     xlim = c(0, 10),
     break.x.by = 1,
-    palette = c("#4F7052", "#B45757"),
-    ggtheme = theme_classic(base_size = 14) +
+
+    palette = c(
+      "#4F7052",
+      "#B45757"
+    ),
+
+    ggtheme = theme_classic(
+      base_size = 14
+    ) +
       theme(
         panel.grid = element_blank(),
-        axis.line = element_line(color = "black", linewidth = 0.8),
-        axis.ticks = element_line(color = "black", linewidth = 0.8),
-        axis.text = element_text(color = "black"),
-        axis.title = element_text(color = "black", face = "bold"),
-        legend.title = element_text(face = "bold"),
+        axis.line = element_line(
+          color = "black",
+          linewidth = 0.8
+        ),
+        axis.ticks = element_line(
+          color = "black",
+          linewidth = 0.8
+        ),
+        axis.text = element_text(
+          color = "black"
+        ),
+        axis.title = element_text(
+          color = "black",
+          face = "bold"
+        ),
+        legend.title = element_text(
+          face = "bold"
+        ),
         legend.position = "top"
       )
   )
 
-  s5 <- summary(fit, times = 5)
+  # 5-year PFI
+  s5 <- summary(
+    fit,
+    times = 5
+  )
 
   fiveyr <- data.frame(
     strata = s5$strata,
     surv = s5$surv
   ) %>%
-    filter(!is.na(surv)) %>%
-    mutate(label = sprintf("%.1f%%", 100 * surv))
+    filter(
+      !is.na(surv)
+    ) %>%
+    mutate(
+      label = sprintf(
+        "%.1f%%",
+        100 * surv
+      )
+    )
 
   km$plot <- km$plot +
     scale_x_continuous(
@@ -172,7 +246,12 @@ plot_km <- function(df, title, y_label, fit_cox, out_prefix = NULL) {
     ) +
     geom_segment(
       data = fiveyr,
-      aes(x = 0, xend = 5, y = surv, yend = surv),
+      aes(
+        x = 0,
+        xend = 5,
+        y = surv,
+        yend = surv
+      ),
       inherit.aes = FALSE,
       linetype = "dashed",
       color = "black",
@@ -180,7 +259,12 @@ plot_km <- function(df, title, y_label, fit_cox, out_prefix = NULL) {
     ) +
     geom_segment(
       data = fiveyr,
-      aes(x = 5, xend = 5, y = 0, yend = surv),
+      aes(
+        x = 5,
+        xend = 5,
+        y = 0,
+        yend = surv
+      ),
       inherit.aes = FALSE,
       linetype = "dashed",
       color = "black",
@@ -188,7 +272,11 @@ plot_km <- function(df, title, y_label, fit_cox, out_prefix = NULL) {
     ) +
     geom_text(
       data = fiveyr,
-      aes(x = 5, y = surv, label = label),
+      aes(
+        x = 5,
+        y = surv,
+        label = label
+      ),
       inherit.aes = FALSE,
       fontface = "bold",
       color = "black",
@@ -202,33 +290,39 @@ plot_km <- function(df, title, y_label, fit_cox, out_prefix = NULL) {
       y = 0.15,
       label = hr_label,
       hjust = 0,
-      size = 5,
-      fontface = "bold"
-    )
-
-  km$table <- km$table +
-    theme_classic(base_size = 12) +
-    theme(
-      panel.grid = element_blank(),
-      axis.line = element_line(color = "black", linewidth = 0.6),
-      axis.ticks = element_line(color = "black", linewidth = 0.6),
-      axis.text = element_text(color = "black"),
-      axis.title = element_text(color = "black", face = "bold")
+      size = 4.5
     )
 
   if (!is.null(out_prefix)) {
-    pdf(file.path(out_dir, paste0(out_prefix, ".pdf")), width = 7, height = 8)
+
+    pdf(
+      file.path(
+        out_dir,
+        paste0(out_prefix, ".pdf")
+      ),
+      width = 7,
+      height = 8
+    )
+
     print(km)
     dev.off()
 
-    png(file.path(out_dir, paste0(out_prefix, ".png")), width = 2100, height = 2400, res = 300)
+    png(
+      file.path(
+        out_dir,
+        paste0(out_prefix, ".png")
+      ),
+      width = 2100,
+      height = 2400,
+      res = 300
+    )
+
     print(km)
     dev.off()
   }
 
   km
 }
-
 run_quartile_km <- function(df, var, title, y_label, out_prefix = NULL) {
   q1 <- quantile(df[[var]], 0.25, na.rm = TRUE)
   q3 <- quantile(df[[var]], 0.75, na.rm = TRUE)
@@ -252,13 +346,16 @@ run_quartile_km <- function(df, var, title, y_label, out_prefix = NULL) {
       n = n(),
       events = sum(status),
       event_rate = mean(status),
-      mean_value = mean(.data[[var]], na.rm = TRUE),
+      median_score = median(.data[[var]], na.rm = TRUE),
       .groups = "drop"
     )
 
   print(q_summary)
 
-  fit_cox <- coxph(Surv(time, status) ~ grp, data = q_df)
+  fit_cox <- coxph(
+  Surv(time_years, status) ~ grp,
+  data = q_df
+)
   print(summary(fit_cox))
 
   km <- plot_km(
@@ -513,7 +610,7 @@ if (length(missing_features) > 0) {
 }
 
 newx <- expr_df[, feature_genes, drop = FALSE]
-valid_rows <- rowSums(is.na(newx)) < ncol(newx)
+valid_rows <- rowSums(is.na(newx)) == 0
 
 rf_tumor <- rep(NA_real_, nrow(expr_df))
 
