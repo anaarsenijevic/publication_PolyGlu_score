@@ -1,372 +1,225 @@
 #!/usr/bin/env Rscript
 
-# Pan-cancer TP53 mutation status in High vs Low RF-score patients
+# ==============================================================================
+# TCGA pan-cancer PolyGlu-TP association with TP53 mutation status
 #
-# This script:
-# 1. reads matched TCGA tumour-normal DESeq2 objects
-# 2. trains a pan-cancer random forest classifier on the fixed 9-gene panel
-# 3. scores tumour patients across TCGA projects using local RNA-seq RDS files
-# 4. retrieves TP53 mutation calls per cancer type from GDC MAF files
-# 5. compares TP53 mutation status in High vs Low quartiles of pan-cancer RF score
-# 6. performs a Fisher's exact test and generates a pan-cancer stacked bar plot
+# Analysis
+# - Train the 9-gene pan-cancer random forest classifier on matched TCGA
+#   tumour/normal datasets using VST-transformed expression values.
+# - Score TCGA primary tumours and summarize multiple primary-tumour samples
+#   at the patient level by the median expression of each panel gene.
+# - Obtain GDC Masked Somatic Mutation MAF files and identify patients with
+#   at least one TP53 mutation.
+# - Define Low (<=25th percentile) and High (>=75th percentile) PolyGlu-TP
+#   groups separately within each cancer type.
+# - Test the association between PolyGlu-TP group and TP53 mutation status
+#   using a Cochran-Mantel-Haenszel test stratified by cancer type.
 #
-# Input:
-# - dds_*_matched_group.rds files
-# - TCGA-<PROJECT>_RNAseq.rds files
-# - GDC MAF files or downloadable GDC mutation data
-#
-# Notes:
-# - Edit all input paths below before running
-# - Only tumour samples are used for the pan-cancer scoring analysis
-# - The fixed 9-gene panel is:
-#   TTLL4, TTLL5, TTLL6, TTLL7, TTLL11, AGBL1, AGBL3, AGBL4, AGBL5
+# Main outputs
+# - rf_pan_tcga_9gene_RAWVST.rds
+# - tcga_pancancer_scored_only.csv
+# - TCGA_panCancer_TP53_mutated_patients.rds
+# - TCGA_panCancer_TP53_mutated_patients.csv
+# - TP53_counts_by_cancer_and_group.csv
+# - TP53_withinCancer_CMH_stats.csv
+# - TP53_withinCancer_CMH_barplot.pdf
+# - TP53_withinCancer_CMH_barplot.png
+# ==============================================================================
 
 suppressPackageStartupMessages({
   library(DESeq2)
   library(tidyverse)
-  library(biomaRt)
   library(caret)
-  library(stringr)
-  library(TCGAbiolinks)
+  library(randomForest)
   library(scales)
-  library(readr)
+  library(stringr)
+  library(SummarizedExperiment)
+  library(TCGAbiolinks)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
 })
 
 set.seed(123)
 
-# ------------------------------------------------------------------
-# Input paths
-# ------------------------------------------------------------------
+# ==============================================================================
+# USER SETTINGS
+# ==============================================================================
 
 tcga_dir <- "path-to-tcga-dds-files"
 gdc_dir <- "path-to-gdc-rnaseq-rds-files"
-cache_root <- "path-to-gdc-maf-cache"
+maf_dir <- "path-to-gdc-maf-cache"
 out_dir <- "path-to-output-folder"
 
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-dir.create(cache_root, recursive = TRUE, showWarnings = FALSE)
+dir.create(maf_dir, recursive = TRUE, showWarnings = FALSE)
 
-if (!dir.exists(tcga_dir)) {
-  stop("Please set 'tcga_dir' to the folder containing dds_*_matched_group.rds files.")
-}
-if (!dir.exists(gdc_dir)) {
-  stop("Please set 'gdc_dir' to the folder containing TCGA-<PROJECT>_RNAseq.rds files.")
-}
-
-# ------------------------------------------------------------------
-# Fixed 9-gene panel
-# ------------------------------------------------------------------
+# GDCdownload created extraction problems on the network share in the working
+# environment. A local cache is therefore used for the raw MAF files. The
+# processed patient-level TP53 table is saved to out_dir and can be reused.
 
 feature_genes <- c(
   "TTLL4", "TTLL5", "TTLL6", "TTLL7", "TTLL11",
   "AGBL1", "AGBL3", "AGBL4", "AGBL5"
 )
 
-pal_p53 <- c("WT" = "#CAE1FF", "Mutated" = "lightsteelblue4")
+cancer_types <- c(
+  "TCGA-UCEC", "TCGA-THCA", "TCGA-STAD", "TCGA-READ", "TCGA-PRAD",
+  "TCGA-LUSC", "TCGA-LUAD", "TCGA-LIHC", "TCGA-KIRP", "TCGA-KIRC",
+  "TCGA-KICH", "TCGA-HNSC", "TCGA-ESCA", "TCGA-COAD", "TCGA-CESC",
+  "TCGA-BLCA", "TCGA-BRCA"
+)
 
-# ------------------------------------------------------------------
-# Helper functions
-# ------------------------------------------------------------------
+pal_p53 <- c(
+  "WT" = "#CAE1FF",
+  "Mutated" = "lightsteelblue4"
+)
 
-aggregate_dup_symbols <- function(mat, symbols, mode = "mean") {
-  keep <- !is.na(symbols) & symbols != ""
-  mat <- mat[keep, , drop = FALSE]
-  symbols <- symbols[keep]
+# ==============================================================================
+# HELPERS
+# ==============================================================================
+
+aggregate_dup_symbols <- function(
+    mat,
+    symbols,
+    mode = c("mean", "sum")[1]
+) {
+  ok <- !is.na(symbols) & symbols != ""
+  mat <- mat[ok, , drop = FALSE]
+  symbols <- symbols[ok]
 
   if (mode == "sum") {
-    out <- rowsum(mat, group = symbols)
+    rowsum(mat, group = symbols)
   } else {
-    split_idx <- split(seq_len(nrow(mat)), symbols)
+    sp <- split(seq_len(nrow(mat)), symbols)
+
     out <- vapply(
-      split_idx,
+      sp,
       function(ix) colMeans(mat[ix, , drop = FALSE]),
       numeric(ncol(mat))
     )
+
     out <- t(out)
-    rownames(out) <- names(split_idx)
+    rownames(out) <- names(sp)
+    out
   }
-
-  out
 }
 
-make_tb_group <- function(df, score_col, q = 0.75) {
-  hi <- as.numeric(quantile(df[[score_col]], q, na.rm = TRUE))
-  lo <- as.numeric(quantile(df[[score_col]], 1 - q, na.rm = TRUE))
-
-  df %>%
-    mutate(
-      group = case_when(
-        .data[[score_col]] >= hi ~ "High",
-        .data[[score_col]] <= lo ~ "Low",
-        TRUE ~ NA_character_
-      ),
-      group = factor(group, levels = c("Low", "High"))
-    ) %>%
-    filter(!is.na(group))
-}
-
-fmt_p <- function(p) {
-  if (is.na(p)) return("p = NA")
-  if (p < 1e-4) return(sprintf("p = %.1e", p))
-  sprintf("p = %.4f", p)
-}
-
-fisher_2x2 <- function(df, group_col = "group", var_col = "p53_status") {
-  d <- df %>% filter(!is.na(.data[[group_col]]), !is.na(.data[[var_col]]))
-
-  if (nrow(d) < 10) {
-    return(list(p = NA_real_, n = nrow(d)))
-  }
-
-  x <- droplevels(factor(d[[group_col]], levels = c("Low", "High")))
-  y <- droplevels(factor(d[[var_col]], levels = c("WT", "Mutated")))
-
-  if (nlevels(x) < 2 || nlevels(y) < 2) {
-    return(list(p = NA_real_, n = nrow(d)))
-  }
-
-  tb <- table(x, y)
-  tb <- tb[c("Low", "High"), c("WT", "Mutated"), drop = FALSE]
-
-  list(
-    p = fisher.test(tb)$p.value,
-    n = sum(tb),
-    tb = tb
+map_ens_to_symbol <- function(ens_ids) {
+  AnnotationDbi::mapIds(
+    org.Hs.eg.db,
+    keys = ens_ids,
+    keytype = "ENSEMBL",
+    column = "SYMBOL",
+    multiVals = "first"
   )
 }
 
-plot_tp53_hi_lo <- function(df,
-                            score_col = "rf_prob_pan",
-                            q = 0.75,
-                            title = "TCGA-Pan: TP53 status vs RF pan-cancer score",
-                            palette = pal_p53,
-                            base_size = 13) {
-  d <- make_tb_group(df, score_col, q = q) %>%
-    mutate(p53_status = factor(p53_status, levels = c("WT", "Mutated"))) %>%
-    filter(!is.na(p53_status))
+# ==============================================================================
+# 1. TRAIN PAN-CANCER RANDOM FOREST
+# ==============================================================================
 
-  if (nrow(d) < 10) {
-    return(ggplot() + theme_void() + labs(title = "Too few data"))
-  }
+message("== Training pan-cancer RF model ==")
 
-  ft <- fisher_2x2(d, "group", "p53_status")
+stopifnot(dir.exists(tcga_dir))
 
-  ann <- tibble(
-    x = "High",
-    y = 0.98,
-    label = paste0(fmt_p(ft$p), "\nFisher (2x2)\n", "n = ", ft$n)
-  )
-
-  ggplot(d, aes(x = group, fill = p53_status)) +
-    geom_bar(position = "fill", color = "white", linewidth = 0.25) +
-    scale_y_continuous(
-      labels = percent,
-      expand = expansion(mult = c(0.02, 0.05))
-    ) +
-    scale_fill_manual(values = palette, drop = FALSE, na.translate = FALSE) +
-    geom_text(
-      data = ann,
-      aes(x = x, y = y, label = label),
-      inherit.aes = FALSE,
-      vjust = 1,
-      size = 3.4
-    ) +
-    labs(
-      title = title,
-      x = NULL,
-      y = "Proportion",
-      fill = "TP53"
-    ) +
-    theme_minimal(base_size = base_size) +
-    theme(
-      plot.title = element_text(face = "bold")
-    )
-}
-
-get_tp53_patients_one_project <- function(project_id,
-                                          cache_root,
-                                          verbose = TRUE,
-                                          workflow_type = "Aliquot Ensemble Somatic Variant Merging and Masking",
-                                          force_download = FALSE) {
-  suppressPackageStartupMessages({
-    library(TCGAbiolinks)
-    library(dplyr)
-    library(readr)
-  })
-
-  proj_dir <- file.path(cache_root, project_id)
-  dir.create(proj_dir, recursive = TRUE, showWarnings = FALSE)
-
-  cache_rds <- file.path(proj_dir, paste0(project_id, "_TP53_mut_patients.rds"))
-
-  if (!force_download && file.exists(cache_rds)) {
-    if (verbose) message("TP53 MAF: ", project_id, " | using cached RDS")
-    return(readRDS(cache_rds))
-  }
-
-  maf_paths <- list.files(
-    proj_dir,
-    pattern = "\\.maf(\\.gz)?$",
-    recursive = TRUE,
-    full.names = TRUE
-  )
-
-  if (!force_download && length(maf_paths) > 0) {
-    if (verbose) message("TP53 MAF: ", project_id, " | MAFs already present, parsing only")
-  } else {
-    if (verbose) message("TP53 MAF: ", project_id, " | downloading")
-
-    q <- tryCatch(
-      GDCquery(
-        project = project_id,
-        data.category = "Simple Nucleotide Variation",
-        data.type = "Masked Somatic Mutation",
-        workflow.type = workflow_type
-      ),
-      error = function(e) NULL
-    )
-
-    if (is.null(q) || nrow(q$results[[1]]) == 0) {
-      saveRDS(NULL, cache_rds)
-      return(NULL)
-    }
-
-    oldwd <- getwd()
-    on.exit(setwd(oldwd), add = TRUE)
-    setwd(proj_dir)
-
-    GDCdownload(q, directory = proj_dir, method = "api")
-
-    tars <- list.files(proj_dir, pattern = "\\.tar\\.gz$", full.names = TRUE)
-    if (length(tars) > 0) {
-      newest_tar <- tars[which.max(file.info(tars)$mtime)]
-      if (verbose) message("  extracting: ", basename(newest_tar))
-      utils::untar(newest_tar, exdir = proj_dir)
-    }
-
-    maf_paths <- list.files(
-      proj_dir,
-      pattern = "\\.maf(\\.gz)?$",
-      recursive = TRUE,
-      full.names = TRUE
-    )
-
-    if (!length(maf_paths)) {
-      saveRDS(NULL, cache_rds)
-      return(NULL)
-    }
-  }
-
-  read_one_maf <- function(p) {
-    x <- suppressWarnings(
-      readr::read_tsv(p, show_col_types = FALSE, progress = FALSE, comment = "#")
-    )
-
-    if (!all(c("Hugo_Symbol", "Tumor_Sample_Barcode") %in% names(x))) {
-      return(NULL)
-    }
-
-    x %>%
-      filter(Hugo_Symbol == "TP53") %>%
-      transmute(
-        patient = substr(as.character(Tumor_Sample_Barcode), 1, 12),
-        cancer_type = sub("^TCGA-", "", project_id),
-        p53_status = "Mutated"
-      )
-  }
-
-  tp53 <- bind_rows(lapply(maf_paths, read_one_maf)) %>%
-    filter(!is.na(patient), patient != "") %>%
-    distinct(patient, cancer_type, .keep_all = TRUE)
-
-  if (!nrow(tp53)) {
-    tp53 <- NULL
-  }
-
-  saveRDS(tp53, cache_rds)
-  tp53
-}
-
-# ------------------------------------------------------------------
-# Ensembl to gene symbol mapping
-# ------------------------------------------------------------------
-
-message("Fetching Ensembl to gene symbol mapping via biomaRt...")
-ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
-
-gene_map <- getBM(
-  attributes = c("ensembl_gene_id", "external_gene_name"),
-  mart = ensembl
-) %>%
-  filter(external_gene_name != "") %>%
-  distinct(ensembl_gene_id, .keep_all = TRUE)
-
-# ------------------------------------------------------------------
-# Load matched TCGA cohorts and train pan-cancer RF
-# ------------------------------------------------------------------
-
-message("Loading matched TCGA DESeq2 objects...")
 dds_files <- list.files(
   tcga_dir,
   pattern = "dds_.*_matched_group\\.rds$",
   full.names = TRUE
 )
 
-if (length(dds_files) == 0) {
-  stop("No matched TCGA DESeq2 files found in 'tcga_dir'.")
-}
+stopifnot(length(dds_files) > 0)
 
-tcga_df <- map_dfr(dds_files, function(f) {
-  project <- sub("dds_(.*)_matched_group\\.rds$", "\\1", basename(f))
+all_tcga <- list()
+
+for (file in dds_files) {
+  project <- sub(
+    "dds_(.*)_matched_group\\.rds$",
+    "\\1",
+    basename(file)
+  )
+
   message("  training: ", project)
 
-  dds <- readRDS(f)
-  vsd <- vst(dds, blind = TRUE)
-  mat <- assay(vsd)
+  dds <- readRDS(file)
+  vsd <- DESeq2::vst(dds, blind = TRUE)
+  mat <- SummarizedExperiment::assay(vsd)
 
-  ens <- sub("\\..*$", "", rownames(mat))
-  sym <- gene_map$external_gene_name[match(ens, gene_map$ensembl_gene_id)]
-  mat_sym <- aggregate_dup_symbols(mat, sym, mode = "mean")
+  ens_ids <- sub("\\..*$", "", rownames(mat))
+  syms <- unname(map_ens_to_symbol(ens_ids))
+  mat_sym <- aggregate_dup_symbols(
+    mat,
+    syms,
+    mode = "mean"
+  )
 
-  matched <- intersect(feature_genes, rownames(mat_sym))
-  if (!length(matched)) {
-    return(tibble())
-  }
+  matched <- intersect(
+    feature_genes,
+    rownames(mat_sym)
+  )
 
-  expr <- t(mat_sym[matched, , drop = FALSE]) %>% as.data.frame()
+  if (!length(matched)) next
+
+  expr <- t(mat_sym[matched, , drop = FALSE]) %>%
+    as.data.frame()
+
   expr$sample <- rownames(expr)
   expr$project <- project
 
-  cond <- tryCatch(colData(dds)[expr$sample, "condition"], error = function(e) NA)
+  cond <- tryCatch(
+    SummarizedExperiment::colData(dds)[expr$sample, "condition"],
+    error = function(e) NULL
+  )
+
+  if (is.null(cond)) next
+
   expr$condition <- as.character(cond)
+  all_tcga[[length(all_tcga) + 1]] <- expr
+}
 
-  as_tibble(expr)
-})
+tcga_df <- dplyr::bind_rows(all_tcga)
+stopifnot(nrow(tcga_df) > 0)
 
-if (nrow(tcga_df) == 0) {
-  stop("No training data could be assembled from the matched TCGA cohorts.")
+for (g in setdiff(feature_genes, colnames(tcga_df))) {
+  tcga_df[[g]] <- NA_real_
 }
 
 tcga_clean <- tcga_df %>%
-  select(all_of(feature_genes), sample, project, condition) %>%
-  filter(if_all(all_of(feature_genes), ~ !is.na(.))) %>%
-  mutate(
+  dplyr::select(
+    dplyr::all_of(feature_genes),
+    sample,
+    project,
+    condition
+  ) %>%
+  dplyr::filter(
+    dplyr::if_all(
+      dplyr::all_of(feature_genes),
+      ~ !is.na(.)
+    )
+  ) %>%
+  dplyr::mutate(
     condition_bin = factor(
-      ifelse(condition == "Primary Tumor", "Tumor", "Normal"),
+      ifelse(
+        condition == "Primary Tumor",
+        "Tumor",
+        "Normal"
+      ),
       levels = c("Normal", "Tumor")
     )
   )
 
-ctrl <- trainControl(
+ctrl <- caret::trainControl(
   method = "cv",
   number = 5,
   classProbs = TRUE,
-  summaryFunction = twoClassSummary,
+  summaryFunction = caret::twoClassSummary,
   savePredictions = TRUE
 )
 
+set.seed(123)
+
 rf_pan <- caret::train(
-  x = tcga_clean[, feature_genes],
+  x = tcga_clean[, feature_genes, drop = FALSE],
   y = tcga_clean$condition_bin,
   method = "rf",
   trControl = ctrl,
@@ -374,147 +227,900 @@ rf_pan <- caret::train(
   tuneLength = 5
 )
 
-saveRDS(rf_pan, file.path(out_dir, "rf_pan_tcga_9gene_RAWVST.rds"))
-
-# ------------------------------------------------------------------
-# Score pan-TCGA tumour patients
-# ------------------------------------------------------------------
-
-message("Scoring tumour patients across TCGA projects...")
-rds_files <- list.files(
-  gdc_dir,
-  pattern = "^TCGA-[A-Z0-9]+_RNAseq\\.rds$",
-  full.names = TRUE
+saveRDS(
+  rf_pan,
+  file.path(out_dir, "rf_pan_tcga_9gene_RAWVST.rds")
 )
 
-if (length(rds_files) == 0) {
-  stop("No TCGA RNA-seq RDS files found in 'gdc_dir'.")
-}
+# ==============================================================================
+# 2. SCORE TCGA PRIMARY-TUMOUR PATIENTS
+# ==============================================================================
 
-score_one_project_pan <- function(rds_path) {
-  project_id <- sub("_RNAseq\\.rds$", "", basename(rds_path))
-  message("  scoring: ", project_id)
+message("== Scoring TCGA primary-tumour patients ==")
 
-  se <- readRDS(rds_path)
-  meta <- as.data.frame(colData(se))
+stopifnot(dir.exists(gdc_dir))
 
-  dds <- DESeqDataSet(se, design = ~1)
-  vsd <- vst(dds, blind = TRUE)
-  mat <- assay(vsd)
+expression_list <- list()
 
-  ens <- sub("\\..*$", "", rownames(mat))
-  sym <- gene_map$external_gene_name[match(ens, gene_map$ensembl_gene_id)]
-  mat_sym <- aggregate_dup_symbols(mat, sym, mode = "mean")
-
-  matched <- intersect(feature_genes, rownames(mat_sym))
-  if (length(matched) < 8) {
-    return(NULL)
-  }
-
-  expr <- t(mat_sym[matched, , drop = FALSE]) %>%
-    as.data.frame() %>%
-    rownames_to_column("sample")
-
-  tumor_samples <- rownames(meta)[meta$sample_type == "Primary Tumor"]
-  if (!length(tumor_samples)) {
-    return(NULL)
-  }
-
-  pat <- expr %>%
-    filter(sample %in% tumor_samples) %>%
-    mutate(
-      patient = substr(sample, 1, 12),
-      cancer_type = sub("^TCGA-", "", project_id)
-    ) %>%
-    group_by(patient, cancer_type) %>%
-    summarise(across(all_of(feature_genes), ~ median(.x, na.rm = TRUE)), .groups = "drop")
-
-  X <- pat %>% select(all_of(feature_genes))
-
-  pat %>%
-    mutate(
-      rf_prob_pan = as.numeric(predict(rf_pan, newdata = X, type = "prob")[, "Tumor"])
-    )
-}
-
-tcga_pan_scored <- bind_rows(lapply(rds_files, score_one_project_pan))
-
-if (nrow(tcga_pan_scored) == 0) {
-  stop("No tumour patients were scored across TCGA projects.")
-}
-
-write.csv(
-  tcga_pan_scored,
-  file.path(out_dir, "tcga_pan_scored_patients.csv"),
-  row.names = FALSE
-)
-
-# ------------------------------------------------------------------
-# Retrieve TP53 mutation calls from GDC MAF files
-# ------------------------------------------------------------------
-
-projects <- unique(tcga_pan_scored$cancer_type)
-project_ids <- paste0("TCGA-", projects)
-
-tp53_list <- lapply(
-  project_ids,
-  get_tp53_patients_one_project,
-  cache_root = cache_root,
-  verbose = TRUE,
-  force_download = FALSE
-)
-
-tp53_pancan_by_cancer <- bind_rows(tp53_list) %>%
-  filter(!is.na(patient), patient != "") %>%
-  distinct(patient, cancer_type, .keep_all = TRUE)
-
-tcga_pan2 <- tcga_pan_scored %>%
-  left_join(
-    tp53_pancan_by_cancer %>%
-      transmute(patient, cancer_type, p53_status = "Mutated"),
-    by = c("patient", "cancer_type")
-  ) %>%
-  mutate(
-    p53_status = ifelse(is.na(p53_status), "WT", p53_status),
-    p53_status = factor(p53_status, levels = c("WT", "Mutated"))
+for (cancer in cancer_types) {
+  file_path <- file.path(
+    gdc_dir,
+    paste0(cancer, "_RNAseq.rds")
   )
 
-write.csv(
-  tcga_pan2,
-  file.path(out_dir, "tcga_pan_scored_with_TP53.csv"),
+  if (!file.exists(file_path)) {
+    message("Skipping missing file: ", file_path)
+    next
+  }
+
+  message("  scoring: ", cancer)
+
+  se <- readRDS(file_path)
+  meta <- as.data.frame(SummarizedExperiment::colData(se))
+
+  assays_avail <- SummarizedExperiment::assayNames(se)
+
+  counts_assay <- if ("unstranded" %in% assays_avail) {
+    "unstranded"
+  } else {
+    assays_avail[1]
+  }
+
+  raw_counts <- SummarizedExperiment::assay(
+    se,
+    counts_assay
+  )
+
+  dds_all <- DESeq2::DESeqDataSetFromMatrix(
+    countData = round(raw_counts),
+    colData = as.data.frame(
+      SummarizedExperiment::colData(se)
+    ),
+    design = ~ 1
+  )
+
+  vsd_all <- DESeq2::vst(
+    dds_all,
+    blind = TRUE
+  )
+
+  mat_all <- SummarizedExperiment::assay(vsd_all)
+
+  rd <- as.data.frame(
+    SummarizedExperiment::rowData(se)
+  )
+
+  gene_name_col <- intersect(
+    c(
+      "gene_name",
+      "hgnc_symbol",
+      "external_gene_name"
+    ),
+    names(rd)
+  )
+
+  if (length(gene_name_col) > 0) {
+    symbols_for_rows <- rd[[gene_name_col[1]]]
+  } else {
+    ens <- if ("gene_id" %in% names(rd)) {
+      rd$gene_id
+    } else {
+      rownames(mat_all)
+    }
+
+    ens <- sub("\\..*$", "", ens)
+
+    symbols_for_rows <- unname(
+      map_ens_to_symbol(ens)
+    )
+  }
+
+  mat_sym <- aggregate_dup_symbols(
+    mat_all,
+    symbols_for_rows,
+    mode = "mean"
+  )
+
+  matched <- intersect(
+    feature_genes,
+    rownames(mat_sym)
+  )
+
+  if (length(matched) < length(feature_genes)) {
+    message(
+      "    skipping ",
+      cancer,
+      ": only ",
+      length(matched),
+      "/",
+      length(feature_genes),
+      " panel genes found."
+    )
+    next
+  }
+
+  expr <- t(
+    mat_sym[feature_genes, , drop = FALSE]
+  ) %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("sample")
+
+  if ("sample_type" %in% names(meta)) {
+    tumor_samples <- rownames(meta)[
+      meta$sample_type == "Primary Tumor"
+    ]
+  } else {
+    tumor_samples <- expr$sample[
+      substr(expr$sample, 14, 15) == "01"
+    ]
+  }
+
+  expr_pat <- expr %>%
+    dplyr::filter(
+      sample %in% tumor_samples
+    ) %>%
+    dplyr::mutate(
+      patient = substr(sample, 1, 12),
+      Cancer_Type = cancer
+    ) %>%
+    dplyr::group_by(
+      patient,
+      Cancer_Type
+    ) %>%
+    dplyr::summarise(
+      dplyr::across(
+        dplyr::all_of(feature_genes),
+        ~ median(.x, na.rm = TRUE)
+      ),
+      .groups = "drop"
+    )
+
+  X <- expr_pat %>%
+    dplyr::select(
+      dplyr::all_of(feature_genes)
+    )
+
+  expr_pat$rf_prob_pan <- as.numeric(
+    predict(
+      rf_pan,
+      newdata = X,
+      type = "prob"
+    )[, "Tumor"]
+  )
+
+  expression_list[[cancer]] <- expr_pat
+}
+
+tcga_pan_scored <- dplyr::bind_rows(
+  expression_list
+)
+
+stopifnot(nrow(tcga_pan_scored) > 0)
+
+readr::write_csv(
+  tcga_pan_scored,
+  file.path(
+    out_dir,
+    "tcga_pancancer_scored_only.csv"
+  )
+)
+
+# ==============================================================================
+# 3. DOWNLOAD/PARSE TP53 MUTATION DATA
+# ==============================================================================
+
+get_tp53_status_tcga <- function(
+    projects,
+    maf_dir
+) {
+  dir.create(
+    maf_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+  out <- list()
+
+  for (prj in projects) {
+    message("\n========================================")
+    message("Processing mutation data: ", prj)
+    message("========================================")
+
+    q <- tryCatch(
+      TCGAbiolinks::GDCquery(
+        project = prj,
+        data.category = "Simple Nucleotide Variation",
+        data.type = "Masked Somatic Mutation",
+        workflow.type =
+          "Aliquot Ensemble Somatic Variant Merging and Masking"
+      ),
+      error = function(e) {
+        message(
+          "Query failed for ",
+          prj,
+          ": ",
+          e$message
+        )
+        NULL
+      }
+    )
+
+    if (is.null(q)) next
+
+    query_results <- tryCatch(
+      TCGAbiolinks::getResults(q),
+      error = function(e) {
+        message(
+          "Could not extract query results for ",
+          prj,
+          ": ",
+          e$message
+        )
+        NULL
+      }
+    )
+
+    if (is.null(query_results)) next
+
+    expected_n <- nrow(query_results)
+
+    message(
+      "GDC reports ",
+      expected_n,
+      " mutation files for ",
+      prj
+    )
+
+    all_existing <- list.files(
+      maf_dir,
+      pattern = "\\.maf(\\.gz)?$",
+      recursive = TRUE,
+      full.names = TRUE
+    )
+
+    existing_mafs <- all_existing[
+      grepl(
+        paste0("[/\\\\]", prj, "[/\\\\]"),
+        all_existing
+      )
+    ]
+
+    existing_mafs <- existing_mafs[
+      file.exists(existing_mafs)
+    ]
+
+    cached_n <- length(existing_mafs)
+
+    message(
+      "Valid cached MAF files found for ",
+      prj,
+      ": ",
+      cached_n
+    )
+
+    if (cached_n < expected_n) {
+      message(
+        "Cache incomplete for ",
+        prj,
+        " (",
+        cached_n,
+        "/",
+        expected_n,
+        "). Redownloading project."
+      )
+
+      project_cache <- file.path(
+        maf_dir,
+        prj
+      )
+
+      if (dir.exists(project_cache)) {
+        unlink(
+          project_cache,
+          recursive = TRUE,
+          force = TRUE
+        )
+      }
+
+      download_ok <- tryCatch(
+        {
+          TCGAbiolinks::GDCdownload(
+            q,
+            directory = maf_dir,
+            method = "api",
+            files.per.chunk = 50
+          )
+
+          TRUE
+        },
+        error = function(e) {
+          message(
+            "Download failed for ",
+            prj,
+            ": ",
+            e$message
+          )
+          FALSE
+        }
+      )
+
+      if (!download_ok) next
+    } else {
+      message(
+        "Using complete cached MAF set for ",
+        prj,
+        " (",
+        cached_n,
+        "/",
+        expected_n,
+        ")"
+      )
+    }
+
+    all_mafs <- list.files(
+      maf_dir,
+      pattern = "\\.maf(\\.gz)?$",
+      recursive = TRUE,
+      full.names = TRUE
+    )
+
+    maf_files <- all_mafs[
+      grepl(
+        paste0("[/\\\\]", prj, "[/\\\\]"),
+        all_mafs
+      )
+    ]
+
+    maf_files <- maf_files[
+      file.exists(maf_files)
+    ]
+
+    message(
+      "Readable MAF files found for ",
+      prj,
+      ": ",
+      length(maf_files)
+    )
+
+    if (!length(maf_files)) {
+      message(
+        "No usable MAF files found for ",
+        prj
+      )
+      next
+    }
+
+    if (length(maf_files) < expected_n) {
+      message(
+        "WARNING: only ",
+        length(maf_files),
+        " of ",
+        expected_n,
+        " expected MAF files were found for ",
+        prj
+      )
+    }
+
+    maf_list <- lapply(
+      maf_files,
+      function(f) {
+        tryCatch(
+          readr::read_tsv(
+            f,
+            comment = "#",
+            show_col_types = FALSE,
+            progress = FALSE,
+            col_types = readr::cols(
+              .default = readr::col_character()
+            )
+          ),
+          error = function(e) {
+            message(
+              "Failed to read ",
+              basename(f),
+              ": ",
+              e$message
+            )
+            NULL
+          }
+        )
+      }
+    )
+
+    maf_list <- maf_list[
+      !vapply(
+        maf_list,
+        is.null,
+        logical(1)
+      )
+    ]
+
+    if (!length(maf_list)) {
+      message(
+        "No readable MAF files for ",
+        prj
+      )
+      next
+    }
+
+    maf <- dplyr::bind_rows(maf_list)
+
+    required_cols <- c(
+      "Hugo_Symbol",
+      "Tumor_Sample_Barcode"
+    )
+
+    if (!all(required_cols %in% colnames(maf))) {
+      message(
+        "Required columns missing for ",
+        prj
+      )
+      next
+    }
+
+    tp53_proj <- maf %>%
+      dplyr::filter(
+        Hugo_Symbol == "TP53"
+      ) %>%
+      dplyr::transmute(
+        patient = substr(
+          Tumor_Sample_Barcode,
+          1,
+          12
+        ),
+        Cancer_Type = prj,
+        p53_status = "Mutated"
+      ) %>%
+      dplyr::filter(
+        !is.na(patient),
+        patient != ""
+      ) %>%
+      dplyr::distinct(
+        patient,
+        Cancer_Type,
+        .keep_all = TRUE
+      )
+
+    message(
+      "TP53-mutated patients identified for ",
+      prj,
+      ": ",
+      nrow(tp53_proj)
+    )
+
+    out[[prj]] <- tp53_proj
+  }
+
+  if (!length(out)) {
+    return(
+      tibble::tibble(
+        patient = character(),
+        Cancer_Type = character(),
+        p53_status = character()
+      )
+    )
+  }
+
+  dplyr::bind_rows(out)
+}
+
+tp53_rds <- file.path(
+  out_dir,
+  "TCGA_panCancer_TP53_mutated_patients.rds"
+)
+
+tp53_csv <- file.path(
+  out_dir,
+  "TCGA_panCancer_TP53_mutated_patients.csv"
+)
+
+if (file.exists(tp53_rds)) {
+  message(
+    "Loading previously processed TP53 mutation table: ",
+    tp53_rds
+  )
+
+  tp53_pat <- readRDS(
+    tp53_rds
+  )
+} else {
+  message(
+    "Processed TP53 table not found; downloading/parsing GDC MAFs."
+  )
+
+  tp53_pat <- get_tp53_status_tcga(
+    projects = cancer_types,
+    maf_dir = maf_dir
+  )
+
+  saveRDS(
+    tp53_pat,
+    tp53_rds
+  )
+
+  readr::write_csv(
+    tp53_pat,
+    tp53_csv
+  )
+
+  message(
+    "Saved processed TP53 mutation table."
+  )
+}
+
+tp53_by_cancer <- tp53_pat %>%
+  dplyr::count(
+    Cancer_Type,
+    name = "n_TP53_mutated"
+  ) %>%
+  dplyr::arrange(Cancer_Type)
+
+print(
+  as.data.frame(tp53_by_cancer),
   row.names = FALSE
 )
 
-# ------------------------------------------------------------------
-# Define High and Low RF-score groups
-# ------------------------------------------------------------------
+# ==============================================================================
+# 4. JOIN TP53 STATUS TO SCORED TUMOURS
+# ==============================================================================
 
-tcga_pan_hilo <- make_tb_group(tcga_pan2, "rf_prob_pan", q = 0.75)
+tcga_tumor_tp53 <- tcga_pan_scored %>%
+  dplyr::left_join(
+    tp53_pat,
+    by = c(
+      "patient",
+      "Cancer_Type"
+    )
+  ) %>%
+  dplyr::mutate(
+    p53_status = ifelse(
+      is.na(p53_status),
+      "WT",
+      "Mutated"
+    ),
+    p53_status = factor(
+      p53_status,
+      levels = c(
+        "WT",
+        "Mutated"
+      )
+    )
+  )
 
-write.csv(
-  tcga_pan_hilo,
-  file.path(out_dir, "tcga_pan_scored_with_TP53_highlow.csv"),
+cat("\n========================================\n")
+cat("TP53 STATUS IN SCORED TUMOURS\n")
+cat("========================================\n")
+
+print(
+  table(
+    tcga_tumor_tp53$p53_status
+  )
+)
+
+print(
+  prop.table(
+    table(
+      tcga_tumor_tp53$p53_status
+    )
+  )
+)
+
+# ==============================================================================
+# 5. DEFINE WITHIN-CANCER LOW/HIGH POLYGLU-TP GROUPS
+# ==============================================================================
+
+tp53_hl <- tcga_tumor_tp53 %>%
+  dplyr::filter(
+    !is.na(rf_prob_pan),
+    !is.na(p53_status),
+    !is.na(Cancer_Type)
+  ) %>%
+  dplyr::group_by(Cancer_Type) %>%
+  dplyr::mutate(
+    q1 = stats::quantile(
+      rf_prob_pan,
+      0.25,
+      na.rm = TRUE
+    ),
+    q3 = stats::quantile(
+      rf_prob_pan,
+      0.75,
+      na.rm = TRUE
+    ),
+    group = dplyr::case_when(
+      rf_prob_pan <= q1 ~ "Low",
+      rf_prob_pan >= q3 ~ "High",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(
+    !is.na(group)
+  ) %>%
+  dplyr::mutate(
+    group = factor(
+      group,
+      levels = c(
+        "Low",
+        "High"
+      )
+    ),
+    Cancer_Type = factor(
+      Cancer_Type
+    )
+  )
+
+# ==============================================================================
+# 6. DESCRIPTIVE STATISTICS
+# ==============================================================================
+
+tp53_summary <- tp53_hl %>%
+  dplyr::count(
+    group,
+    p53_status,
+    name = "n"
+  ) %>%
+  dplyr::group_by(group) %>%
+  dplyr::mutate(
+    total = sum(n),
+    proportion = n / total
+  ) %>%
+  dplyr::ungroup()
+
+print(
+  as.data.frame(tp53_summary),
   row.names = FALSE
 )
 
-# ------------------------------------------------------------------
-# Plot overall pan-cancer TP53 status in High vs Low RF-score groups
-# ------------------------------------------------------------------
+tp53_counts_by_cancer <- tp53_hl %>%
+  dplyr::count(
+    Cancer_Type,
+    group,
+    p53_status,
+    name = "n"
+  )
 
-g_pan_overall <- plot_tp53_hi_lo(
-  tcga_pan2,
-  score_col = "rf_prob_pan",
-  q = 0.75,
-  title = "TCGA-Pan: TP53 mutation status vs RF pan-cancer score",
-  palette = pal_p53
+readr::write_csv(
+  tp53_counts_by_cancer,
+  file.path(
+    out_dir,
+    "TP53_counts_by_cancer_and_group.csv"
+  )
 )
 
-print(g_pan_overall)
+# ==============================================================================
+# 7. COCHRAN-MANTEL-HAENSZEL TEST STRATIFIED BY CANCER TYPE
+# ==============================================================================
 
-ggsave(
-  file.path(out_dir, "PanTCGA_TP53_vs_PANscore_overall.png"),
-  g_pan_overall,
-  width = 6,
-  height = 4,
-  dpi = 300
+cmh_array <- xtabs(
+  ~ group + p53_status + Cancer_Type,
+  data = tp53_hl
 )
+
+valid_strata <- vapply(
+  seq_len(dim(cmh_array)[3]),
+  function(i) {
+    x <- cmh_array[, , i]
+
+    all(rowSums(x) > 0) &&
+      all(colSums(x) > 0)
+  },
+  logical(1)
+)
+
+cmh_array_valid <- cmh_array[
+  ,
+  ,
+  valid_strata,
+  drop = FALSE
+]
+
+cat(
+  "\nCancer strata included in CMH test: ",
+  sum(valid_strata),
+  " / ",
+  length(valid_strata),
+  "\n",
+  sep = ""
+)
+
+cmh_test <- stats::mantelhaen.test(
+  cmh_array_valid
+)
+
+print(cmh_test)
+
+cmh_p <- cmh_test$p.value
+cmh_or <- unname(cmh_test$estimate)
+cmh_ci <- cmh_test$conf.int
+
+# ==============================================================================
+# 8. SUMMARY AND OUTPUT TABLE
+# ==============================================================================
+
+pooled_table <- table(
+  tp53_hl$group,
+  tp53_hl$p53_status
+)
+
+low_n <- sum(
+  pooled_table["Low", ]
+)
+
+high_n <- sum(
+  pooled_table["High", ]
+)
+
+low_mut <- pooled_table[
+  "Low",
+  "Mutated"
+]
+
+high_mut <- pooled_table[
+  "High",
+  "Mutated"
+]
+
+low_mut_pct <- 100 * low_mut / low_n
+high_mut_pct <- 100 * high_mut / high_n
+
+cat("\n========================================\n")
+cat("TP53 ASSOCIATION ANALYSIS\n")
+cat("Within-cancer PolyGlu-TP quartiles\n")
+cat("========================================\n")
+
+cat(
+  "Low: n = ",
+  low_n,
+  " | TP53 mutated = ",
+  low_mut,
+  " (",
+  round(low_mut_pct, 1),
+  "%)\n",
+  sep = ""
+)
+
+cat(
+  "High: n = ",
+  high_n,
+  " | TP53 mutated = ",
+  high_mut,
+  " (",
+  round(high_mut_pct, 1),
+  "%)\n",
+  sep = ""
+)
+
+cat(
+  "CMH p = ",
+  format(cmh_p, scientific = TRUE),
+  "\n",
+  sep = ""
+)
+
+cat(
+  "Common odds ratio = ",
+  round(cmh_or, 3),
+  "\n",
+  sep = ""
+)
+
+cat(
+  "95% CI = ",
+  round(cmh_ci[1], 3),
+  " to ",
+  round(cmh_ci[2], 3),
+  "\n",
+  sep = ""
+)
+
+tp53_stats <- tibble::tibble(
+  analysis = "Within-cancer PolyGlu-TP quartiles",
+  low_n = low_n,
+  high_n = high_n,
+  low_TP53_mutated = low_mut,
+  high_TP53_mutated = high_mut,
+  low_TP53_mutated_percent = low_mut_pct,
+  high_TP53_mutated_percent = high_mut_pct,
+  CMH_common_OR = cmh_or,
+  CMH_CI_low = cmh_ci[1],
+  CMH_CI_high = cmh_ci[2],
+  CMH_p = cmh_p
+)
+
+readr::write_csv(
+  tp53_stats,
+  file.path(
+    out_dir,
+    "TP53_withinCancer_CMH_stats.csv"
+  )
+)
+
+# ==============================================================================
+# 9. PLOT
+# ==============================================================================
+
+p_label <- if (cmh_p < 2.2e-16) {
+  "CMH p < 2.2 \u00d7 10\u207b\u00b9\u2076"
+} else {
+  paste0(
+    "CMH p = ",
+    format(
+      cmh_p,
+      scientific = TRUE,
+      digits = 2
+    )
+  )
+}
+
+stat_label <- paste0(
+  p_label,
+  "\nOR = ",
+  round(cmh_or, 2),
+  " (95% CI ",
+  round(cmh_ci[1], 2),
+  "\u2013",
+  round(cmh_ci[2], 2),
+  ")"
+)
+
+p_tp53 <- ggplot2::ggplot(
+  tp53_hl,
+  ggplot2::aes(
+    x = group,
+    fill = p53_status
+  )
+) +
+  ggplot2::geom_bar(
+    position = "fill",
+    color = "white",
+    linewidth = 0.3,
+    width = 0.72
+  ) +
+  ggplot2::scale_fill_manual(
+    values = pal_p53,
+    drop = FALSE
+  ) +
+  ggplot2::scale_y_continuous(
+    labels = scales::percent_format(
+      accuracy = 1
+    ),
+    expand = ggplot2::expansion(
+      mult = c(0.02, 0.05)
+    )
+  ) +
+  ggplot2::scale_x_discrete(
+    labels = c(
+      "Low" = "Low\n(\u226425th percentile)",
+      "High" = "High\n(\u226575th percentile)"
+    )
+  ) +
+  ggplot2::annotate(
+    "text",
+    x = 1.5,
+    y = 0.97,
+    label = stat_label,
+    hjust = 0.5,
+    vjust = 1,
+    size = 4
+  ) +
+  ggplot2::labs(
+    x = NULL,
+    y = "Proportion",
+    fill = "TP53"
+  ) +
+  ggplot2::theme_classic(
+    base_size = 14
+  ) +
+  ggplot2::theme(
+    axis.text = ggplot2::element_text(
+      color = "black"
+    ),
+    axis.title = ggplot2::element_text(
+      color = "black",
+      face = "bold"
+    ),
+    legend.position = "right"
+  )
+
+print(p_tp53)
